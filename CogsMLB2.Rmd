@@ -1,0 +1,147 @@
+---
+title: "CogsMLB2"
+author: "Alex Eisert"
+date: "12/16/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(baseballr)
+library(dplyr)
+```
+
+```{r}
+## Data from FanGraphs on steal attempts per season
+
+##https://www.fangraphs.com/leaders.aspx?pos=all&stats=pit&lg=all&qual=0&type=8&season=2020&month=0&season1=1990&ind=0&team=0,ss&rost=0&age=0&filter=&players=0&startdate=&enddate=
+
+fgdata1 <- read.csv("Fangraphs Leaderboard (11).csv")
+
+##https://www.fangraphs.com/leaders.aspx?pos=all&stats=bat&lg=all&qual=0&type=0&season=2020&month=0&season1=1990&ind=0&team=0,ss&rost=0&age=0&filter=&players=0&startdate=1990-01-01&enddate=2020-12-31
+
+fgdata2 <- read.csv("Fangraphs Leaderboard (13).csv") 
+fgdata1$Games <- fgdata1$W + fgdata1$L
+fgdata2$Games <- fgdata1$Games
+fgdata2 <- fgdata2 %>% select("Season", "SB", "CS", "Games")
+fgdata2 <- fgdata2 %>% mutate(SBsuccess = SB/(SB + CS))
+fgdata2 <- fgdata2 %>% mutate(SBattempts = SB + CS)
+fgdata2 <- fgdata2 %>% mutate(SBattmps.tm.gm = SBattempts/Games)
+fgdata2
+summary(lm(SBsuccess ~ SBattmps.tm.gm, data = fgdata2))
+plot(fgdata2$Season, fgdata2$SBattmps.tm.gm)
+```
+
+
+```{r}
+##Scraping data from Statcast's "Baseball Savant" database. Had to scrape one week at a time by virtue of query limits on Baseball Savant. Code is adapted from Bill Petti's "How to Build a Statcast Database from BaseballSavant, v2.0" (2020).
+
+dates <- seq.Date(as.Date('2019-03-28'),
+                    as.Date('2019-09-29'), by = 'week')
+date_grid <- tibble(start_date = dates, 
+                      end_date = dates + 6)
+safe_savant <- safely(scrape_statcast_savant)
+payload <- map(.x = seq_along(date_grid$start_date), 
+                 ~{message(paste0('\nScraping week of ', date_grid$start_date[.x], '...\n'))
+                   
+                   payload <- safe_savant(start_date = date_grid$start_date[.x], 
+                                          end_date = date_grid$end_date[.x], type = 'pitcher')
+                   
+                   return(payload)
+                 })
+  
+  payload_df <- map(payload, 'result')
+  
+##Joining all weeks.
+  
+  combined <- payload_df %>% bind_rows()
+```
+
+```{r}
+##Dataset was out of order. Had to order first by game, then by at bat in game, then by pitch for each at bat.
+combined <- combined[
+  with(combined, order(game_date, home_team, away_team, at_bat_number, inning, -inning_top, outs_when_up, player_name, balls, strikes, pitch_number)),
+       ]
+
+##Binary variable for which half of the inning
+
+combined$inning_top <- ifelse(combined$inning_topbot=="Top",1,0)
+
+##Categorical variable for previous pitch; using a for loop, I saved the [i-1] pitch for each pitch as a new variable.
+
+prev_pitch <- rep(NA, 732344)
+
+for(i in 2:732344) {
+  prev_pitch[i] <- ifelse(combined$player_name[i-1]==combined$player_name[i], combined$pitch_type[i-1], NA)
+}
+
+combined$prev_pitch <- prev_pitch
+
+##Setting the reference (baseline) category for the previous pitch variable to be a fourseam fastball.
+combined$prev_pitch <- as.factor(combined$prev_pitch)
+combined$prev_pitch <- relevel(combined$prev_pitch, ref = "FF")
+
+##Binary variable for whether there was a successful baserunner advance on the pitch; if the hitter is the same on the next pitch (so, the ball was not put into play) and one or more of the base runners advanced, it was coded as "1." It was also coded as "1" if the batter on the next pitch was different, but the advancement only occurred on the strikeout pitch of the previous at bat (i.e., the ball was still not put into play).
+
+advanced1b <- rep(NA, 732344)
+
+for(i in 1:732343) {
+  advanced1b[i] <- ifelse(((combined$player_name[i]==combined$player_name[i+1]) & ((combined$on_1b[i]==combined$on_2b[i+1] | combined$on_2b[i]==combined$on_3b[i+1]) | (combined$post_bat_score[i]!=combined$bat_score[i+1] & combined$bb_type[i]=="null"))) | ((combined$on_1b[i]==combined$on_2b[i+1] | combined$on_2b[i]==combined$on_3b[i+1] | (combined$post_bat_score[i]!=combined$bat_score[i+1] & combined$bb_type[i]=="null")) & (grepl("strikeout", combined$events[i]) & combined$inning_top[i]==combined$inning_top[i+1])),1,0)
+}
+
+advanced1b <- ifelse(is.na(advanced1b), 0, advanced1b)
+combined$advanced1b <- advanced1b
+
+##Binary variable for whether there was a failed baserunner advancement attempt on the pitch. If the hitter is the same on the next pitch but the number of outs increased, it was coded as "1." Or, if the Statcast "description" of the play described a caught stealing or pickoff, it was also coded as "1."
+
+caught <- rep(NA, 732344)
+
+for(i in 1:732343) {
+  caught[i] <- ifelse((combined$player_name[i]==combined$player_name[i+1] & combined$outs_when_up[i]!=combined$outs_when_up[i+1]) | (grepl("caught", combined$events[i]) | grepl("pickoff", combined$events[i]) | combined$events[i]=="strikeout_double_play" | combined$events[i]=="other_out") | (grepl("caught", combined$des[i]) | grepl("pick", combined$des[i])),1,0)
+}
+
+caught <- ifelse(is.na(caught), 0, caught)
+combined$caught <- caught
+
+##Binary variable for steal attempt, if there was a caught baserunner or if a baserunner advanced.
+
+combined$steal_attempt <- ifelse(combined$advanced1b==1 | combined$caught==1, 1,0)
+
+##Binary variable for if the pitcher and hitter had the same dominant hand.
+
+combined$handedness_match <- ifelse(combined$stand==combined$p_throws,1,0)
+
+##Continuous variable for the discrepancy between the hitting team's score and the fielding team's score.
+combined$rundiff <- combined$bat_score - combined$fld_score
+
+##Setting the reference (baseline) category for the infield and outfield fielding alignments to be the "standard" (or, non-shifted) alignment.
+
+combined$if_fielding_alignment <- as.factor(combined$if_fielding_alignment)
+combined$if_fielding_alignment <- relevel(combined$if_fielding_alignment, ref = "Standard")
+combined$of_fielding_alignment <- as.factor(combined$of_fielding_alignment)
+combined$of_fielding_alignment <- relevel(combined$of_fielding_alignment, ref = "Standard")
+
+##Creating a unique ID for each at bat, which consists of pasting when the at bat occurred in the game (i.e., "4" if it was the fourth at bat) onto the unique ID for the game itself.
+
+combined$at_bat_ID <- paste0(combined$game_pk, combined$at_bat_number)
+
+##Created a binary variable that recorded, on each pitch in an at bat, whether a steal was attempted during that at bat at any time.
+
+combined <- combined %>% group_by(at_bat_ID) %>% mutate(at_bat_steal_attempt = any(steal_attempt==1))
+
+##Created a subset of the original dataset that only included those at bats during which a steal was attempted (i.e., when the variable above was equal to 1)
+
+steal.atbats <- combined %>% filter(at_bat_steal_attempt==TRUE)
+
+##Multiple linear regression model using data from at bats during which a steal attempt did occur at some point to identify factors common to the precise pitches on which attempts occurred.
+
+fit <- lm(steal_attempt ~ balls + strikes + stand + p_throws + outs_when_up + inning_top + prev_pitch + is_summer + of_fielding_alignment + if_fielding_alignment + inning + at_bat_number + pitch_number + rundiff + handedness_match, data = steal.atbats)
+summary(fit)
+
+##Multiple linear regression model using data from pitches on which steal attempts occurred to identify factors common to those pitches on which successful attempts occurred.
+
+fit2 <- lm(advanced1b ~ balls + strikes + stand + p_throws + outs_when_up + inning_top + prev_pitch + is_summer + of_fielding_alignment + if_fielding_alignment + inning + at_bat_number + pitch_number + rundiff + handedness_match, data = steal.pitches)
+summary(fit2)
+```
+
